@@ -243,8 +243,10 @@ impl PerfBuffer {
             let buf = &mut buffers[buf_n];
 
             let event_start = tail % self.size;
+            let mut event_buf = [0u8; size_of::<perf_event_header>()];
+            fill_buf(event_start, base, self.size, &mut event_buf);
             let event =
-                unsafe { ptr::read_unaligned((base + event_start) as *const perf_event_header) };
+                unsafe { ptr::read_unaligned(event_buf.as_ptr() as *const perf_event_header) };
             let event_size = event.size as usize;
             log::trace!(
                 "event_start: {}, event_size: {}, base: {:#x}, head: {:#x}, tail: {:#x}",

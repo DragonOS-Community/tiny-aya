@@ -243,7 +243,7 @@ impl PerfBuffer {
             let buf = &mut buffers[buf_n];
 
             let event_start = tail % self.size;
-            let mut event_buf = [0u8; size_of::<perf_event_header>()];
+            let mut event_buf = [0u8; core::mem::size_of::<perf_event_header>()];
             fill_buf(event_start, base, self.size, &mut event_buf);
             let event =
                 unsafe { ptr::read_unaligned(event_buf.as_ptr() as *const perf_event_header) };

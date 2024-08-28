@@ -1,11 +1,14 @@
+pub mod hash_map;
 pub mod perf;
-
 use core::mem;
 use std::{
     ffi::CString,
     fmt, io,
+    marker::PhantomData,
+    ops::Deref,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     path::Path,
+    ptr,
 };
 
 use aya_obj::{
@@ -14,6 +17,7 @@ use aya_obj::{
     maps::{InvalidMapTypeError, PinningType},
     parse_map_info, EbpfSectionKind,
 };
+pub use hash_map::{HashMap, PerCpuHashMap};
 use libc::{getrlimit, rlim_t, rlimit, RLIMIT_MEMLOCK, RLIM_INFINITY};
 pub use perf::PerfEventArray;
 use thiserror::Error;
@@ -24,10 +28,11 @@ use crate::{
     pin::PinError,
     sys::{
         bpf_create_map, bpf_get_object, bpf_map_freeze, bpf_map_get_fd_by_id,
-        bpf_map_get_info_by_fd, bpf_map_update_elem_ptr, bpf_pin_object, iter_map_ids,
-        SyscallError,
+        bpf_map_get_info_by_fd, bpf_map_get_next_key, bpf_map_update_elem_ptr, bpf_pin_object,
+        iter_map_ids, SyscallError,
     },
-    util::{bytes_of_bpf_name, KernelVersion},
+    util::{bytes_of_bpf_name, nr_cpus, KernelVersion},
+    Pod,
 };
 
 #[derive(Error, Debug)]
@@ -307,17 +312,16 @@ impl MapData {
     pub(crate) fn finalize(&mut self) -> Result<(), MapError> {
         let Self { obj, fd } = self;
         if !obj.data().is_empty() && obj.section_kind() != EbpfSectionKind::Bss {
-            log::error!(
+            log::trace!(
                 "map data is not empty, but section kind is not BSS, {:?}",
                 obj.section_kind()
             );
             let data = obj.data();
-            let value = u64::from_le_bytes(data[0..8].try_into().unwrap());
-            log::error!(
-                "bpf_map_update_elem_ptr, key_ptr: {:?}, value_ptr: {:?}, value: {}",
+            log::trace!(
+                "bpf_map_update_elem_ptr, key_ptr: {:?}, value_ptr: {:?}, value: {:?}",
                 &0 as *const _,
-                obj.data_mut().as_mut_ptr(),
-                value
+                obj.data().as_ptr(),
+                data
             );
             bpf_map_update_elem_ptr(fd.as_fd(), &0 as *const _, obj.data_mut().as_mut_ptr(), 0)
                 .map_err(|(_, io_error)| SyscallError {
@@ -553,6 +557,246 @@ pub fn loaded_maps() -> impl Iterator<Item = Result<MapInfo, MapError>> {
     })
 }
 
+pub(crate) fn check_kv_size<K, V>(map: &MapData) -> Result<(), MapError> {
+    let size = mem::size_of::<K>();
+    let expected = map.obj.key_size() as usize;
+    if size != expected {
+        return Err(MapError::InvalidKeySize { size, expected });
+    }
+    let size = mem::size_of::<V>();
+    let expected = map.obj.value_size() as usize;
+    if size != expected {
+        return Err(MapError::InvalidValueSize { size, expected });
+    };
+    Ok(())
+}
+
+/// An iterable map
+pub trait IterableMap<K: Pod, V> {
+    /// Get a generic map handle
+    fn map(&self) -> &MapData;
+
+    /// Get the value for the provided `key`
+    fn get(&self, key: &K) -> Result<V, MapError>;
+}
+
+/// Iterator returned by `map.keys()`.
+pub struct MapKeys<'coll, K: Pod> {
+    map: &'coll MapData,
+    err: bool,
+    key: Option<K>,
+}
+
+impl<'coll, K: Pod> MapKeys<'coll, K> {
+    fn new(map: &'coll MapData) -> Self {
+        Self {
+            map,
+            err: false,
+            key: None,
+        }
+    }
+}
+
+impl<K: Pod> Iterator for MapKeys<'_, K> {
+    type Item = Result<K, MapError>;
+
+    fn next(&mut self) -> Option<Result<K, MapError>> {
+        if self.err {
+            return None;
+        }
+
+        let fd = self.map.fd().as_fd();
+        let key =
+            bpf_map_get_next_key(fd, self.key.as_ref()).map_err(|(_, io_error)| SyscallError {
+                call: "bpf_map_get_next_key",
+                io_error,
+            });
+        match key {
+            Err(err) => {
+                self.err = true;
+                Some(Err(err.into()))
+            }
+            Ok(key) => {
+                self.key = key;
+                key.map(Ok)
+            }
+        }
+    }
+}
+
+/// Iterator returned by `map.iter()`.
+pub struct MapIter<'coll, K: Pod, V, I: IterableMap<K, V>> {
+    keys: MapKeys<'coll, K>,
+    map: &'coll I,
+    _v: PhantomData<V>,
+}
+
+impl<'coll, K: Pod, V, I: IterableMap<K, V>> MapIter<'coll, K, V, I> {
+    fn new(map: &'coll I) -> Self {
+        Self {
+            keys: MapKeys::new(map.map()),
+            map,
+            _v: PhantomData,
+        }
+    }
+}
+
+impl<K: Pod, V, I: IterableMap<K, V>> Iterator for MapIter<'_, K, V, I> {
+    type Item = Result<(K, V), MapError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.keys.next() {
+                Some(Ok(key)) => match self.map.get(&key) {
+                    Ok(value) => return Some(Ok((key, value))),
+                    Err(MapError::KeyNotFound) => continue,
+                    Err(e) => return Some(Err(e)),
+                },
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+        }
+    }
+}
+pub(crate) struct PerCpuKernelMem {
+    bytes: Vec<u8>,
+}
+
+impl PerCpuKernelMem {
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+}
+
+/// A slice of per-CPU values.
+///
+/// Used by maps that implement per-CPU storage like [`PerCpuHashMap`].
+///
+/// # Examples
+///
+/// ```no_run
+/// # #[derive(thiserror::Error, Debug)]
+/// # enum Error {
+/// #     #[error(transparent)]
+/// #     IO(#[from] std::io::Error),
+/// #     #[error(transparent)]
+/// #     Map(#[from] aya::maps::MapError),
+/// #     #[error(transparent)]
+/// #     Ebpf(#[from] aya::EbpfError)
+/// # }
+/// # let bpf = aya::Ebpf::load(&[])?;
+/// use aya::maps::PerCpuValues;
+/// use aya::util::nr_cpus;
+///
+/// let values = PerCpuValues::try_from(vec![42u32; nr_cpus()?])?;
+/// # Ok::<(), Error>(())
+/// ```
+#[derive(Debug)]
+pub struct PerCpuValues<T: Pod> {
+    values: Box<[T]>,
+}
+
+impl<T: Pod> TryFrom<Vec<T>> for PerCpuValues<T> {
+    type Error = io::Error;
+
+    fn try_from(values: Vec<T>) -> Result<Self, Self::Error> {
+        let nr_cpus = nr_cpus()?;
+        if values.len() != nr_cpus {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("not enough values ({}), nr_cpus: {}", values.len(), nr_cpus),
+            ));
+        }
+        Ok(Self {
+            values: values.into_boxed_slice(),
+        })
+    }
+}
+
+impl<T: Pod> PerCpuValues<T> {
+    pub(crate) fn alloc_kernel_mem() -> Result<PerCpuKernelMem, io::Error> {
+        let value_size = (mem::size_of::<T>() + 7) & !7;
+        Ok(PerCpuKernelMem {
+            bytes: vec![0u8; nr_cpus()? * value_size],
+        })
+    }
+
+    pub(crate) unsafe fn from_kernel_mem(mem: PerCpuKernelMem) -> Self {
+        let mem_ptr = mem.bytes.as_ptr() as usize;
+        let value_size = (mem::size_of::<T>() + 7) & !7;
+        let mut values = Vec::new();
+        let mut offset = 0;
+        while offset < mem.bytes.len() {
+            values.push(ptr::read_unaligned((mem_ptr + offset) as *const _));
+            offset += value_size;
+        }
+
+        Self {
+            values: values.into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn build_kernel_mem(&self) -> Result<PerCpuKernelMem, io::Error> {
+        let mut mem = Self::alloc_kernel_mem()?;
+        let mem_ptr = mem.as_mut_ptr() as usize;
+        let value_size = (mem::size_of::<T>() + 7) & !7;
+        for i in 0..self.values.len() {
+            unsafe { ptr::write_unaligned((mem_ptr + i * value_size) as *mut _, self.values[i]) };
+        }
+
+        Ok(mem)
+    }
+}
+
+impl<T: Pod> Deref for PerCpuValues<T> {
+    type Target = Box<[T]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+#[cfg(test)]
+mod test_utils {
+    use aya_obj::{
+        generated::{bpf_cmd, bpf_map_type},
+        maps::bpf_map_def,
+    };
+
+    use crate::{
+        maps::MapData,
+        obj::{self, maps::LegacyMap, EbpfSectionKind},
+        sys::{override_syscall, Syscall},
+    };
+
+    pub(super) fn new_map(obj: obj::Map) -> MapData {
+        override_syscall(|call| match call {
+            Syscall::Ebpf {
+                cmd: bpf_cmd::BPF_MAP_CREATE,
+                ..
+            } => Ok(crate::MockableFd::mock_signed_fd().into()),
+            call => panic!("unexpected syscall {:?}", call),
+        });
+        MapData::create(obj, "foo", None).unwrap()
+    }
+
+    pub(super) fn new_obj_map<K>(map_type: bpf_map_type) -> obj::Map {
+        obj::Map::Legacy(LegacyMap {
+            def: bpf_map_def {
+                map_type: map_type as u32,
+                key_size: std::mem::size_of::<K>() as u32,
+                value_size: 4,
+                max_entries: 1024,
+                ..Default::default()
+            },
+            section_index: 0,
+            section_kind: EbpfSectionKind::Maps,
+            data: Vec::new(),
+            symbol_index: None,
+        })
+    }
+}
+
 // Implements TryFrom<Map> for different map implementations. Different map implementations can be
 // constructed from different variants of the map enum. Also, the implementation may have type
 // parameters (which we assume all have the bound `Pod` and nothing else).
@@ -610,4 +854,9 @@ impl_try_from_map!(() {
 
 impl_try_from_map!(() {
     PerfEventArray,
+});
+
+impl_try_from_map!((K, V) {
+    HashMap from HashMap|LruHashMap,
+    PerCpuHashMap from PerCpuHashMap|PerCpuLruHashMap,
 });

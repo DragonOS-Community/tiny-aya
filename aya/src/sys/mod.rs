@@ -1,4 +1,5 @@
 pub(crate) mod bpf;
+#[cfg(test)]
 pub(crate) mod fake;
 pub(crate) mod perf_event;
 
@@ -11,11 +12,10 @@ use std::{
 
 use aya_obj::generated::{bpf_attr, bpf_cmd, perf_event_attr};
 pub(crate) use bpf::*;
+#[cfg(test)]
+pub(crate) use fake::*;
 use libc::{pid_t, SYS_bpf, SYS_perf_event_open};
 use thiserror::Error;
-
-#[cfg(test)]
-use crate::sys::fake::{TEST_MMAP_RET, TEST_SYSCALL};
 
 pub(crate) type SysResult<T> = Result<T, (i64, io::Error)>;
 
@@ -82,7 +82,7 @@ fn syscall(call: Syscall<'_>) -> SysResult<i64> {
     #[cfg(test)]
     return TEST_SYSCALL.with(|test_impl| unsafe { test_impl.borrow()(call) });
 
-    info!("syscall: {:?}", call);
+    log::debug!("syscall: {:?}", call);
     #[cfg_attr(test, allow(unreachable_code))]
     {
         let ret = unsafe {

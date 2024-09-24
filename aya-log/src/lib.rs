@@ -77,9 +77,11 @@ use thiserror::Error;
 
 #[derive(Copy, Clone)]
 #[repr(transparent)]
+#[allow(unused)]
 struct RecordFieldWrapper(RecordField);
 #[derive(Copy, Clone)]
 #[repr(transparent)]
+#[allow(unused)]
 struct ArgumentWrapper(Argument);
 #[derive(Copy, Clone)]
 #[repr(transparent)]

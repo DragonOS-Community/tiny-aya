@@ -175,3 +175,10 @@ pub(crate) fn page_size() -> usize {
     // (unsafe { sysconf(_SC_PAGESIZE) }) as usize
     4096
 }
+
+/// Get the number of possible cpus.
+///
+/// See `/sys/devices/system/cpu/possible`.
+pub fn nr_cpus() -> Result<usize, io::Error> {
+    Ok(possible_cpus()?.len())
+}

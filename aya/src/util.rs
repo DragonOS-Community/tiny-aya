@@ -2,7 +2,7 @@ use core::{
     slice,
     str::{FromStr, Utf8Error},
 };
-use std::io;
+use std::{fs, io};
 
 /// Represents a kernel version, in major.minor.release version.
 // Adapted from https://docs.rs/procfs/latest/procfs/sys/kernel/struct.Version.html.
@@ -127,14 +127,13 @@ pub(crate) const POSSIBLE_CPUS: &str = "/sys/devices/system/cpu/possible";
 ///
 /// See `/sys/devices/system/cpu/possible`.
 pub(crate) fn possible_cpus() -> Result<Vec<u32>, io::Error> {
-    // let data = fs::read_to_string(POSSIBLE_CPUS)?;
-    // parse_cpu_ranges(data.trim()).map_err(|_| {
-    //     io::Error::new(
-    //         io::ErrorKind::Other,
-    //         format!("unexpected {POSSIBLE_CPUS} format"),
-    //     )
-    // })
-    Ok(vec![0])
+    let data = fs::read_to_string(POSSIBLE_CPUS)?;
+    parse_cpu_ranges(data.trim()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("unexpected {POSSIBLE_CPUS} format"),
+        )
+    })
 }
 
 fn parse_cpu_ranges(data: &str) -> Result<Vec<u32>, ()> {
@@ -160,14 +159,13 @@ fn parse_cpu_ranges(data: &str) -> Result<Vec<u32>, ()> {
 
 /// Returns the numeric IDs of the CPUs currently online.
 pub fn online_cpus() -> Result<Vec<u32>, io::Error> {
-    // let data = fs::read_to_string(ONLINE_CPUS)?;
-    // parse_cpu_ranges(data.trim()).map_err(|_| {
-    //     io::Error::new(
-    //         io::ErrorKind::Other,
-    //         format!("unexpected {ONLINE_CPUS} format"),
-    //     )
-    // })
-    Ok(vec![0])
+    let data = fs::read_to_string(ONLINE_CPUS)?;
+    parse_cpu_ranges(data.trim()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("unexpected {ONLINE_CPUS} format"),
+        )
+    })
 }
 
 pub(crate) fn page_size() -> usize {

@@ -20,5 +20,5 @@ async-io = { version = "2.0", default-features = false }
 tokio = { version = "1.24.0", default-features = false }
 env_logger = { version = "0.11", default-features = false }
 testing_logger = { version = "0.1.1", default-features = false }
-aya-log-common = { git = "https://github.com/aya-rs/aya", rev = "3d57d35", default-features = false }
-aya-obj = { git = "https://github.com/aya-rs/aya", rev = "3d57d35", features = ["std"] }
+aya-log-common = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/aya.git", rev = "3d57d35", default-features = false }
+aya-obj = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/aya.git", rev = "3d57d35", features = ["std"] }
